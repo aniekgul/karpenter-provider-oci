@@ -316,7 +316,7 @@ func (p *DefaultProvider) decorateInstanceType(ctx context.Context, it *OciInsta
 	vnicAvailable := true
 	secondVnicsNum := -1
 	if shape.MaxVnicAttachments != nil {
-		secondVnicsNum = *shape.MaxVnicAttachments - 1
+		secondVnicsNum = p.getMaxVnicAttachmentsForShape(ctx, shape, ocpu) - 1
 	}
 
 	if nodeClass.Spec.NetworkConfig.SecondaryVnicConfigs != nil &&
@@ -335,6 +335,55 @@ func (p *DefaultProvider) decorateInstanceType(ctx context.Context, it *OciInsta
 	}
 
 	return err
+}
+
+/*
+If shape is a Flexible shape and selected Ocpu number larger than Min Ocpu options
+Then work out the maxSecondaryVnicAttachements from MaxVnicAttachmentOptions
+
+	minVnic + (ocpu - minOcpu) * defaultVnicPerOcpu
+
+Otherwise return shape.maxVnicAttahments
+*/
+func (p *DefaultProvider) getMaxVnicAttachmentsForShape(ctx context.Context, shape *ocicore.Shape, ocpu float32) int {
+
+	if shape.IsFlexible != nil && *shape.IsFlexible &&
+		isValidMaxVnicAttachmentOptions(shape.MaxVnicAttachmentOptions) &&
+		isValidOcpuOptions(shape.OcpuOptions) {
+		minOcpu := *shape.OcpuOptions.Min
+		if ocpu > minOcpu {
+			vnicMin := float32(*shape.MaxVnicAttachmentOptions.Min)
+			vnicMax := *shape.MaxVnicAttachmentOptions.Max
+			vnicPerOcpu := float32(1)
+			if shape.MaxVnicAttachmentOptions.DefaultPerOcpu != nil {
+				vnicPerOcpu = *shape.MaxVnicAttachmentOptions.DefaultPerOcpu
+			}
+
+			maxPossibleVnics := vnicMin + (ocpu-minOcpu)*vnicPerOcpu
+			if maxPossibleVnics > vnicMax {
+				maxPossibleVnics = vnicMax
+			}
+
+			log.FromContext(ctx).V(1).Info("MaxVnicAttachmentDetails",
+				"vnicMin", vnicMin, "vnicMax", vnicMax, "vnicPerOcpu",
+				vnicPerOcpu, "maxPossibleVnics", maxPossibleVnics)
+			return int(maxPossibleVnics)
+		} else {
+			return *shape.MaxVnicAttachmentOptions.Min // when ocpu<=minOcpu using *shape.MaxVnicAttachmentOptions.Min
+		}
+	}
+
+	return *shape.MaxVnicAttachments
+}
+
+func isValidMaxVnicAttachmentOptions(maxVnicAttachmentOptions *ocicore.ShapeMaxVnicAttachmentOptions) bool {
+	return maxVnicAttachmentOptions != nil &&
+		maxVnicAttachmentOptions.Min != nil &&
+		maxVnicAttachmentOptions.Max != nil
+}
+
+func isValidOcpuOptions(ocpuOptions *ocicore.ShapeOcpuOptions) bool {
+	return ocpuOptions != nil && ocpuOptions.Min != nil
 }
 
 func makeOnDemandOffering(shapeName string, ads []string, price float64, available bool,

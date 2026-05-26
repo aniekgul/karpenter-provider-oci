@@ -39,6 +39,12 @@
       "VAR_NSG1_ID"
     ],
     "NsgName": "VAR_NSG1_NAME",
+    "ShapeConfigs": [
+          {
+            "ocpus": 8,
+            "memoryInGbs": 64
+          }
+        ],
     "SecondVnicConfigs": [
       {
         "VnicDisplayname": "SVnic1",

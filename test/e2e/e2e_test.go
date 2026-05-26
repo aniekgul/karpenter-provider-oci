@@ -335,6 +335,7 @@ func TestKarpenterE2ENpn(t *testing.T) {
 		s.TestScaleUp()
 		s.TestNodeOverlay()
 		s.TestNpnDriftDetection()
+		s.TestFlexShapeMultipleVnics()
 		s.TestScaleDown()
 		s.TestStaticCapacity()
 	})
@@ -634,6 +635,16 @@ func (s *E2ETestSuite) TestShapeConfig() {
 		},
 	}
 
+	s.patchAndVerifyShapeConfigs(cases, nodePool)
+}
+
+func (s *E2ETestSuite) patchAndVerifyShapeConfigs(cases []struct {
+	name         string
+	patchFunc    func(*ociv1beta1.OCINodeClass)
+	verifyFunc   func(*corev1.Node, any) bool
+	capacityType string
+	expected     string
+}, nodePool *karpenterv1.NodePool) {
 	for _, tc := range cases {
 		s.t.Run(tc.name, func(t *testing.T) {
 			t.Logf("Start %s shape config testing", tc.name)
@@ -654,6 +665,41 @@ func (s *E2ETestSuite) TestShapeConfig() {
 			s.t.Logf("%s shape config test successful", tc.name)
 		})
 	}
+}
+
+func (s *E2ETestSuite) TestFlexShapeMultipleVnics() {
+	s.t.Log("Start Flex Shape Multiple Vnics testing")
+	s.ensureDeploymentReplicas(s.testConfig.TestDeployment.Name, s.testConfig.Namespace,
+		s.testConfig.TestDeployment.Replicas)
+	nodePool := &karpenterv1.NodePool{}
+	require.NoError(s.t, s.ctrlClient.Get(s.ctx, client.ObjectKey{Name: s.testConfig.NodePool.Name}, nodePool))
+
+	cases := []struct {
+		name         string
+		patchFunc    func(*ociv1beta1.OCINodeClass)
+		verifyFunc   func(*corev1.Node, any) bool
+		capacityType string
+		expected     string
+	}{
+		{
+			name: "FexShapeMultipleVnicsTest",
+			patchFunc: func(p *ociv1beta1.OCINodeClass) {
+				p.Spec.ShapeConfigs = createShapeConfig(s.testConfig.OCINodeClass.ShapeConfigs)
+				newSecondaryVnicList := make([]*ociv1beta1.SecondaryVnicConfig, 0)
+				newSecondaryVnicList = append(newSecondaryVnicList, p.Spec.NetworkConfig.SecondaryVnicConfigs[0])
+				newSecondaryVnicConfig := p.Spec.NetworkConfig.SecondaryVnicConfigs[0].DeepCopy()
+				newSecondaryVnicConfig.VnicDisplayName = lo.ToPtr("SVnic2")
+				newSecondaryVnicList = append(newSecondaryVnicList, newSecondaryVnicConfig)
+
+				p.Spec.NetworkConfig.SecondaryVnicConfigs = newSecondaryVnicList
+			},
+			verifyFunc:   s.verifyShapeConfig,
+			capacityType: karpenterv1.CapacityTypeOnDemand,
+			expected:     "VM.Standard.E4.Flex.8o.64g.1_1b",
+		},
+	}
+
+	s.patchAndVerifyShapeConfigs(cases, nodePool)
 }
 
 func (s *E2ETestSuite) TestCapacityReservation() {

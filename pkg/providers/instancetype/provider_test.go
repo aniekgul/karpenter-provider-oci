@@ -2144,3 +2144,149 @@ func TestListInstanceTypes_GPUShapeWithNoTaints(t *testing.T) {
 	assert.Error(t, err)
 	assert.Empty(t, its)
 }
+
+func TestGetMaxVnicAttachmentsForShape(t *testing.T) {
+	tests := []struct {
+		name               string
+		isFlexible         *bool
+		ocpuOptions        *ocicore.ShapeOcpuOptions
+		maxVnicOpts        *ocicore.ShapeMaxVnicAttachmentOptions
+		maxVnicAttachments *int
+		ocpu               float32
+		want               int
+	}{
+		{
+			name:        "flexible, ocpu == min value",
+			isFlexible:  lo.ToPtr(true),
+			ocpuOptions: &ocicore.ShapeOcpuOptions{Min: lo.ToPtr(float32(2))},
+			maxVnicOpts: &ocicore.ShapeMaxVnicAttachmentOptions{
+				Min:            lo.ToPtr(4),
+				Max:            lo.ToPtr(float32(10)),
+				DefaultPerOcpu: lo.ToPtr(float32(2))},
+			maxVnicAttachments: lo.ToPtr(2),
+			ocpu:               2,
+			want:               4, // falls back to ShapeMaxVnicAttachmentOptions.Min
+		},
+		{
+			name:        "flexible, ocpu > min but result in bounds",
+			isFlexible:  lo.ToPtr(true),
+			ocpuOptions: &ocicore.ShapeOcpuOptions{Min: lo.ToPtr(float32(2))},
+			maxVnicOpts: &ocicore.ShapeMaxVnicAttachmentOptions{
+				Min:            lo.ToPtr(4),
+				Max:            lo.ToPtr(float32(10)),
+				DefaultPerOcpu: lo.ToPtr(float32(2))},
+			maxVnicAttachments: lo.ToPtr(2),
+			ocpu:               4, // ocpuDiff = 2, maxPossible = 4 + 2*2 = 8
+			want:               8,
+		},
+		{
+			name:        "flexible, ocpu > min but hits max",
+			isFlexible:  lo.ToPtr(true),
+			ocpuOptions: &ocicore.ShapeOcpuOptions{Min: lo.ToPtr(float32(2))},
+			maxVnicOpts: &ocicore.ShapeMaxVnicAttachmentOptions{
+				Min:            lo.ToPtr(4),
+				Max:            lo.ToPtr(float32(7)),
+				DefaultPerOcpu: lo.ToPtr(float32(2))},
+			maxVnicAttachments: lo.ToPtr(2),
+			ocpu:               5, // ocpuDiff = 3, maxPossible = 4 + 3*2 = 10 -> hits 7
+			want:               7,
+		},
+		{
+			name:               "non-flexible shape",
+			isFlexible:         lo.ToPtr(false),
+			maxVnicAttachments: lo.ToPtr(4),
+			ocpu:               2,
+			want:               4,
+		},
+		{
+			name:               "missing isFlexible returns MaxVnicAttachments",
+			isFlexible:         nil,
+			maxVnicAttachments: lo.ToPtr(2),
+			ocpu:               4,
+			want:               2,
+		},
+		{
+			name:               "missing maxVnicOpts falls back to MaxVnicAttachments",
+			isFlexible:         lo.ToPtr(true),
+			ocpuOptions:        &ocicore.ShapeOcpuOptions{Min: lo.ToPtr(float32(2))},
+			maxVnicOpts:        nil,
+			maxVnicAttachments: lo.ToPtr(2),
+			ocpu:               8,
+			want:               2,
+		},
+		{
+			name:        "missing maxVnicOpts.Min falls back to MaxVnicAttachments",
+			isFlexible:  lo.ToPtr(true),
+			ocpuOptions: &ocicore.ShapeOcpuOptions{Min: lo.ToPtr(float32(2))},
+			maxVnicOpts: &ocicore.ShapeMaxVnicAttachmentOptions{
+				Min:            nil,
+				Max:            lo.ToPtr(float32(10)),
+				DefaultPerOcpu: lo.ToPtr(float32(2))},
+			maxVnicAttachments: lo.ToPtr(2),
+			ocpu:               8,
+			want:               2,
+		},
+		{
+			name:        "missing maxVnicOpts.Max falls back to MaxVnicAttachments",
+			isFlexible:  lo.ToPtr(true),
+			ocpuOptions: &ocicore.ShapeOcpuOptions{Min: lo.ToPtr(float32(2))},
+			maxVnicOpts: &ocicore.ShapeMaxVnicAttachmentOptions{
+				Min:            lo.ToPtr(4),
+				Max:            nil,
+				DefaultPerOcpu: lo.ToPtr(float32(2))},
+			maxVnicAttachments: lo.ToPtr(2),
+			ocpu:               8,
+			want:               2,
+		},
+		{
+			name:        "nil ocpuOptions falls back to MaxVnicAttachments",
+			isFlexible:  lo.ToPtr(true),
+			ocpuOptions: nil,
+			maxVnicOpts: &ocicore.ShapeMaxVnicAttachmentOptions{
+				Min:            lo.ToPtr(4),
+				Max:            lo.ToPtr(float32(10)),
+				DefaultPerOcpu: lo.ToPtr(float32(2))},
+			maxVnicAttachments: lo.ToPtr(2),
+			ocpu:               6,
+			want:               2,
+		},
+		{
+			name:        "nil ocpuOptions.Min falls back to MaxVnicAttachments",
+			isFlexible:  lo.ToPtr(true),
+			ocpuOptions: nil,
+			maxVnicOpts: &ocicore.ShapeMaxVnicAttachmentOptions{
+				Min:            lo.ToPtr(4),
+				Max:            lo.ToPtr(float32(10)),
+				DefaultPerOcpu: lo.ToPtr(float32(2))},
+			maxVnicAttachments: lo.ToPtr(2),
+			ocpu:               6,
+			want:               2,
+		},
+		{
+			name:        "flexible, defaultPerOcpu is nil",
+			isFlexible:  lo.ToPtr(true),
+			ocpuOptions: &ocicore.ShapeOcpuOptions{Min: lo.ToPtr(float32(2))},
+			maxVnicOpts: &ocicore.ShapeMaxVnicAttachmentOptions{
+				Min:            lo.ToPtr(4),
+				Max:            lo.ToPtr(float32(10)),
+				DefaultPerOcpu: nil},
+			maxVnicAttachments: lo.ToPtr(2),
+			ocpu:               4, // ocpuDiff = 2, maxPossible = 4 + 2*1 = 6
+			want:               6,
+		},
+	}
+
+	p := &DefaultProvider{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shape := &ocicore.Shape{
+				IsFlexible:               tt.isFlexible,
+				OcpuOptions:              tt.ocpuOptions,
+				MaxVnicAttachmentOptions: tt.maxVnicOpts,
+				MaxVnicAttachments:       tt.maxVnicAttachments,
+			}
+			got := p.getMaxVnicAttachmentsForShape(context.Background(), shape, tt.ocpu)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
