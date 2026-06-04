@@ -294,6 +294,25 @@ func TestProvider_DecideCapacityType(t *testing.T) {
 			offerings: cloudprovider.Offerings{makeOffering(corev1.CapacityTypeOnDemand)},
 			want:      corev1.CapacityTypeOnDemand,
 		},
+		{
+			name:        "on-demand when spot offering is unavailable",
+			isBurstable: false,
+			claimReqs: []corev1.NodeSelectorRequirementWithMinValues{
+				{Key: corev1.CapacityTypeLabelKey, Operator: v1.NodeSelectorOpIn, Values: []string{corev1.CapacityTypeSpot}},
+			},
+			offerings: cloudprovider.Offerings{
+				{
+					Available: false,
+					Requirements: scheduling.NewRequirements(
+						scheduling.NewRequirement(corev1.CapacityTypeLabelKey, v1.NodeSelectorOpIn,
+							corev1.CapacityTypeSpot),
+					),
+					Price: 0.1,
+				},
+				makeOffering(corev1.CapacityTypeOnDemand),
+			},
+			want: corev1.CapacityTypeOnDemand,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -776,6 +795,33 @@ func TestProvider_LaunchInstance_RequestConstruction(t *testing.T) {
 			it, imgRes, netRes, nil, pp)
 		require.NoError(t, err)
 		require.NotNil(t, fc.LastLaunchReq.LaunchInstanceDetails.PreemptibleInstanceConfig, "expected preemptible config")
+	})
+
+	t.Run("on-demand fallback when spot offering is unavailable", func(t *testing.T) {
+		claim := baseClaim.DeepCopy()
+		// NodePool allows both spot and on-demand, with spot preferred.
+		claim.Spec.Requirements = []corev1.NodeSelectorRequirementWithMinValues{
+			{Key: corev1.CapacityTypeLabelKey, Operator: v1.NodeSelectorOpIn,
+				Values: []string{corev1.CapacityTypeSpot, corev1.CapacityTypeOnDemand}},
+		}
+		// The shape's only spot offering is out of host capacity (Available=false, as the
+		// unavailable-offerings cache surfaces it via setOfferings), leaving on-demand available.
+		it := &instancetype.OciInstanceType{Shape: "VM.Standard.E4.Flex"}
+		spotUnavailable := makeOfferingWithCapType(corev1.CapacityTypeSpot)
+		spotUnavailable.Available = false
+		it.Offerings = cloudprovider.Offerings{
+			spotUnavailable,
+			makeOfferingWithCapType(corev1.CapacityTypeOnDemand),
+		}
+		nodeClass := baseNodeClass.DeepCopy()
+
+		_, err := p.LaunchInstance(context.TODO(), claim, nodeClass,
+			it, imgRes, netRes, nil, pp)
+		require.NoError(t, err)
+		// decideCapacityType should fall back to on-demand within the same pool, so the launch
+		// request must not carry a preemptible (spot) config.
+		require.Nil(t, fc.LastLaunchReq.LaunchInstanceDetails.PreemptibleInstanceConfig,
+			"expected on-demand fallback (no preemptible config) when the spot offering is unavailable")
 	})
 
 	t.Run("non-flexible should not set shape config", func(t *testing.T) {

@@ -1003,6 +1003,40 @@ func TestSetOfferings_PreemptibleSpotAdded(t *testing.T) {
 	assert.True(t, hasSpot, "expected spot offerings for preemptible non-burstable shape")
 }
 
+func TestSetOfferings_ExcludesUnavailableOfferings(t *testing.T) {
+	unavailableOfferings := cache.NewUnavailableOfferings(0)
+	// mark only the spot offering in PHX-AD-1 as out of host capacity.
+	unavailableOfferings.MarkUnavailable(context.Background(), "VM.Standard.E4.Flex", "PHX-AD-1", "spot")
+
+	p := &DefaultProvider{
+		preemptibleShapes:    PreemptibleShapes{"VM.STANDARD.E4": "VM.Standard.E4"},
+		unavailableOfferings: unavailableOfferings,
+	}
+
+	shape := &ocicore.Shape{
+		Shape:              lo.ToPtr("VM.Standard.E4.Flex"),
+		MaxVnicAttachments: lo.ToPtr(4),
+	}
+	sa := &ShapeAndAd{Shape: shape, Ads: []string{"tenancy:PHX-AD-1", "tenancy:PHX-AD-2"}}
+	it := &OciInstanceType{
+		InstanceType: cloudprovider.InstanceType{Name: "VM.Standard.E4.Flex"},
+		Shape:        "VM.Standard.E4.Flex",
+	}
+
+	err := p.setOfferings(context.Background(), it, &ociv1beta1.OCINodeClass{}, sa, true, 1.0,
+		[]v1.Taint{preemptibleTaintNoSchedule})
+	assert.NoError(t, err)
+
+	for _, o := range it.Offerings {
+		capType := o.Requirements.Get("karpenter.sh/capacity-type").Any()
+		if capType == "spot" && o.Zone() == "PHX-AD-1" {
+			assert.False(t, o.Available, "spot offering in PHX-AD-1 should be marked unavailable")
+		} else {
+			assert.True(t, o.Available, "offering %s/%s should remain available", capType, o.Zone())
+		}
+	}
+}
+
 func TestSetOfferings_NoPreemptibleSpotIfTaintMissing(t *testing.T) {
 	// Preemptible shapes configured to include E4 (prefix match)
 	p := &DefaultProvider{

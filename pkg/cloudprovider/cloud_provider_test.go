@@ -17,6 +17,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/oracle/karpenter-provider-oci/pkg/apis/v1beta1"
+	ocicache "github.com/oracle/karpenter-provider-oci/pkg/cache"
 	"github.com/oracle/karpenter-provider-oci/pkg/controllers/nodeclasses"
 	"github.com/oracle/karpenter-provider-oci/pkg/fakes"
 	npnv1beta1 "github.com/oracle/karpenter-provider-oci/pkg/npn/apis/v1beta1"
@@ -41,11 +42,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
+	clock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/events"
+	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	coretest "sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
 
@@ -653,6 +661,32 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 			Expect(errors.As(err, &createErr)).To(BeTrue())
 			Expect(createErr.ConditionReason).To(Equal("LaunchInstanceFailed"))
 		})
+
+		It("should return insufficient capacity when all instance types are out of host capacity", func() {
+			launchCount := 0
+			cp := newUnitTestCloudProvider(unitTestCloudProviderOptions{
+				kubeClient:    kubeClient,
+				instanceTypes: []*instancetype.OciInstanceType{instanceA, instanceB},
+				imageProvider: &FakeImageProvider{
+					ResolveImageForShapeFn: func(_ context.Context, _ *v1beta1.ImageConfig,
+						_ string) (*image.ImageResolveResult, error) {
+						return imageResult, nil
+					},
+				},
+				instanceProvider: &FakeInstanceProvider{
+					LaunchInstanceFn: func(_ context.Context, _ *v1.NodeClaim, _ *v1beta1.OCINodeClass,
+						_ *instancetype.OciInstanceType, _ *image.ImageResolveResult, _ *network.NetworkResolveResult,
+						_ *kms.KmsKeyResolveResult, _ *placement.Proposal) (*instance.InstanceInfo, error) {
+						launchCount++
+						return nil, instance.NoCapacityError{}
+					},
+				},
+			})
+
+			_, err := cp.Create(context.Background(), nodeClaim)
+			Expect(cloudprovider.IsInsufficientCapacityError(err)).To(BeTrue())
+			Expect(launchCount).To(Equal(2))
+		})
 	})
 
 	Context("Drift", func() {
@@ -958,3 +992,172 @@ func (f fakeServiceError) GetOpcRequestID() string { return "req-id" }
 
 var _ common.ServiceError = fakeServiceError{}
 var _ error = fakeServiceError{}
+
+// These tests drive Karpenter core's real scheduler/provisioner against the OCI CloudProvider to
+// verify cross-NodePool fallback when one NodePool's only offering goes out of host capacity.
+//
+// The unavailable-offerings cache feeds offering availability into the instance-type provider
+// (production wiring is unit-tested in pkg/providers/instancetype). Here we exercise the end-to-end
+// behaviour: once an offering is marked unavailable, GetInstanceTypes reports it as unavailable and
+// core's scheduler routes new capacity to the other NodePool.
+var _ = Describe("CloudProvider NodePool Fallback", func() {
+	const zone = "PHX-AD-1"
+
+	var (
+		preferredShape     string
+		fallbackShape      string
+		preferredClass     string
+		fallbackClass      string
+		unavailable        *ocicache.UnavailableOfferings
+		cp                 *CloudProvider
+		cluster            *state.Cluster
+		prov               *provisioning.Provisioner
+		provCtx            context.Context
+		preferredNodeClass *v1beta1.OCINodeClass
+		fallbackNodeClass  *v1beta1.OCINodeClass
+		preferredPool      *v1.NodePool
+		fallbackPool       *v1.NodePool
+		smallPodResources  corev1.ResourceRequirements
+	)
+
+	BeforeEach(func() {
+		preferredShape = uniqueName("shape-preferred")
+		fallbackShape = uniqueName("shape-fallback")
+		unavailable = ocicache.NewUnavailableOfferings(0)
+
+		preferredNodeClass = testReadyNodeClass(uniqueName("preferred"))
+		fallbackNodeClass = testReadyNodeClass(uniqueName("fallback"))
+		preferredClass = preferredNodeClass.Name
+		fallbackClass = fallbackNodeClass.Name
+
+		// Instance types are resolved per-NodeClass and have their on-demand offering gated by the
+		// shared unavailable-offerings cache, mirroring the production setOfferings behaviour.
+		instanceTypeProvider := &FakeInstanceTypeProvider{
+			ListFn: func(_ context.Context, nodeClass *v1beta1.OCINodeClass, _ []corev1.Taint) ([]*instancetype.OciInstanceType, error) {
+				var shape string
+				switch nodeClass.Name {
+				case preferredClass:
+					shape = preferredShape
+				case fallbackClass:
+					shape = fallbackShape
+				default:
+					return nil, nil
+				}
+				it := fallbackTestInstanceType(shape, 10)
+				for _, o := range it.Offerings {
+					if unavailable.IsUnavailable(shape, o.Zone(), o.CapacityType()) {
+						o.Available = false
+					}
+				}
+				return []*instancetype.OciInstanceType{it}, nil
+			},
+		}
+
+		instanceProvider := &FakeInstanceProvider{
+			LaunchInstanceFn: func(_ context.Context, nc *v1.NodeClaim, _ *v1beta1.OCINodeClass,
+				it *instancetype.OciInstanceType, _ *image.ImageResolveResult, _ *network.NetworkResolveResult,
+				_ *kms.KmsKeyResolveResult, _ *placement.Proposal) (*instance.InstanceInfo, error) {
+				return &instance.InstanceInfo{
+					Instance: testInstanceWithShape(it.Shape, nc.Labels[v1.NodePoolLabelKey]),
+				}, nil
+			},
+		}
+
+		cp = newUnitTestCloudProvider(unitTestCloudProviderOptions{
+			kubeClient:           k8sClient,
+			instanceTypeProvider: instanceTypeProvider,
+			instanceProvider:     instanceProvider,
+		})
+
+		fakeClock := clock.NewFakeClock(time.Now())
+		recorder := events.NewRecorder(&record.FakeRecorder{})
+		cluster = state.NewCluster(fakeClock, k8sClient, cp)
+		prov = provisioning.NewProvisioner(k8sClient, recorder, cp, cluster, fakeClock)
+		provCtx = coreoptions.ToContext(ctx, coretest.Options())
+
+		// Preferred pool has the higher weight, so the scheduler always tries it first.
+		preferredPool = fallbackTestNodePool(uniqueName("preferred-pool"), preferredClass, 100)
+		fallbackPool = fallbackTestNodePool(uniqueName("fallback-pool"), fallbackClass, 10)
+
+		ExpectApplied(provCtx, k8sClient, preferredNodeClass, fallbackNodeClass, preferredPool, fallbackPool)
+
+		// Sized so that only one such pod fits per node, forcing a fresh node per pod.
+		smallPodResources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("1500m"),
+				corev1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+		}
+	})
+
+	AfterEach(func() {
+		// ExpectCleanedUp references a TestNodeClass CRD that is not registered in this envtest, so we
+		// delete the objects this suite created directly. Unique names keep specs isolated.
+		ExpectDeleted(provCtx, k8sClient, preferredPool, fallbackPool, preferredNodeClass, fallbackNodeClass)
+	})
+
+	It("schedules to the preferred NodePool while its offering is available", func() {
+		pod := coretest.UnschedulablePod(coretest.PodOptions{ResourceRequirements: smallPodResources})
+		bindings := ExpectProvisioned(provCtx, k8sClient, cluster, cp, prov, pod)
+
+		binding := bindings.Get(pod)
+		Expect(binding).ToNot(BeNil())
+		Expect(binding.NodeClaim).ToNot(BeNil())
+		Expect(binding.NodeClaim.Labels[v1.NodePoolLabelKey]).To(Equal(preferredPool.Name))
+		Expect(binding.NodeClaim.Labels[corev1.LabelInstanceTypeStable]).To(Equal(preferredShape))
+	})
+
+	It("falls back to another NodePool once the preferred offering is out of capacity", func() {
+		// First pod lands on the preferred pool.
+		pod1 := coretest.UnschedulablePod(coretest.PodOptions{ResourceRequirements: smallPodResources})
+		bindings := ExpectProvisioned(provCtx, k8sClient, cluster, cp, prov, pod1)
+		binding1 := bindings.Get(pod1)
+		Expect(binding1).ToNot(BeNil())
+		Expect(binding1.NodeClaim).ToNot(BeNil())
+		Expect(binding1.NodeClaim.Labels[v1.NodePoolLabelKey]).To(Equal(preferredPool.Name))
+
+		// Preferred pool's on-demand offering goes out of host capacity.
+		unavailable.MarkUnavailable(provCtx, preferredShape, zone, v1.CapacityTypeOnDemand)
+
+		// Next pod cannot reuse the preferred node and the preferred offering is unavailable, so the
+		// scheduler must fall back to the other NodePool.
+		pod2 := coretest.UnschedulablePod(coretest.PodOptions{ResourceRequirements: smallPodResources})
+		bindings = ExpectProvisioned(provCtx, k8sClient, cluster, cp, prov, pod2)
+		binding2 := bindings.Get(pod2)
+		Expect(binding2).ToNot(BeNil())
+		Expect(binding2.NodeClaim).ToNot(BeNil())
+		Expect(binding2.NodeClaim.Labels[v1.NodePoolLabelKey]).To(Equal(fallbackPool.Name))
+		Expect(binding2.NodeClaim.Labels[corev1.LabelInstanceTypeStable]).To(Equal(fallbackShape))
+	})
+})
+
+// fallbackTestInstanceType builds an instance type with a single on-demand offering plus a pod
+// capacity so the core scheduler treats the resulting node as schedulable.
+func fallbackTestInstanceType(shape string, price float64) *instancetype.OciInstanceType {
+	it := testInstanceType(shape, price)
+	it.Capacity[corev1.ResourcePods] = *resource.NewQuantity(110, resource.DecimalSI)
+	return it
+}
+
+func fallbackTestNodePool(name, nodeClassName string, weight int32) *v1.NodePool {
+	return coretest.NodePool(v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: v1.NodePoolSpec{
+			Weight: lo.ToPtr(weight),
+			Template: v1.NodeClaimTemplate{
+				Spec: v1.NodeClaimTemplateSpec{
+					NodeClassRef: &v1.NodeClassReference{
+						Kind:  "OCINodeClass",
+						Group: v1beta1.Group,
+						Name:  nodeClassName,
+					},
+					Requirements: []v1.NodeSelectorRequirementWithMinValues{
+						{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpExists},
+						{Key: v1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn,
+							Values: []string{v1.CapacityTypeOnDemand}},
+					},
+				},
+			},
+		},
+	})
+}

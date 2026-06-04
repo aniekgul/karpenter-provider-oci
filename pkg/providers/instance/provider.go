@@ -25,6 +25,7 @@ import (
 	"github.com/oracle/karpenter-provider-oci/pkg/providers/network"
 	"github.com/oracle/karpenter-provider-oci/pkg/providers/npn"
 	"github.com/oracle/karpenter-provider-oci/pkg/providers/placement"
+	"github.com/oracle/karpenter-provider-oci/pkg/utils"
 	ocicore "github.com/oracle/oci-go-sdk/v65/core"
 	ociwr "github.com/oracle/oci-go-sdk/v65/workrequests"
 	"github.com/samber/lo"
@@ -88,6 +89,7 @@ type DefaultProvider struct {
 	launchTimeoutBM       time.Duration
 	launchTimeOutFailOver bool
 	pollInterval          time.Duration
+	unavailableOfferings  *cache.UnavailableOfferings
 }
 
 func NewProvider(ctx context.Context, computeClient oci.ComputeClient,
@@ -97,7 +99,8 @@ func NewProvider(ctx context.Context, computeClient oci.ComputeClient,
 	networkProvider network.Provider,
 	launchTimeoutVM, launchTimeoutBM time.Duration,
 	launchTimeOutFailOver bool,
-	pollInterval time.Duration) (*DefaultProvider, error) {
+	pollInterval time.Duration,
+	unavailableOfferings *cache.UnavailableOfferings) (*DefaultProvider, error) {
 	p := &DefaultProvider{
 		computeClient:         computeClient,
 		workRequestClient:     workRequestClient,
@@ -111,6 +114,7 @@ func NewProvider(ctx context.Context, computeClient oci.ComputeClient,
 		launchTimeoutBM:       launchTimeoutBM,
 		launchTimeOutFailOver: launchTimeOutFailOver,
 		pollInterval:          pollInterval,
+		unavailableOfferings:  unavailableOfferings,
 	}
 
 	return p, nil
@@ -123,7 +127,7 @@ func (p *DefaultProvider) LaunchInstance(ctx context.Context,
 	imageResolveResult *image.ImageResolveResult,
 	networkResolveResult *network.NetworkResolveResult,
 	kmsKeyResolveResult *kms.KmsKeyResolveResult,
-	placementProposal *placement.Proposal) (*InstanceInfo, error) {
+	placementProposal *placement.Proposal) (result *InstanceInfo, err error) {
 	imageSource := ocicore.InstanceSourceViaImageDetails{
 		ImageId:  imageResolveResult.Images[0].Id,
 		KmsKeyId: nil,
@@ -141,13 +145,26 @@ func (p *DefaultProvider) LaunchInstance(ctx context.Context,
 		imageSource.BootVolumeVpusPerGB = nodeClass.Spec.VolumeConfig.BootVolumeConfig.VpusPerGB
 	}
 
+	capacityType := decideCapacityType(ctx, nodeClaim, instanceType)
 	var preemptibleInstanceConfig *ocicore.PreemptibleInstanceConfigDetails
 	isPreemptible := false
-	if decideCapacityType(ctx, nodeClaim, instanceType) == corev1.CapacityTypeSpot {
+	if capacityType == corev1.CapacityTypeSpot {
 		preemptibleInstanceConfig = &ocicore.PreemptibleInstanceConfigDetails{
 			PreemptionAction: &ocicore.TerminatePreemptionAction{},
 		}
 		isPreemptible = true
+	}
+
+	// when a launch attempt fails because of host-capacity exhaustion, record the
+	// (shape, AD/zone, capacity-type) offering as unavailable so it is excluded from offering
+	// availability until the cache entry expires, enabling spot->on-demand and cross-NodePool fallback.
+	if p.unavailableOfferings != nil {
+		defer func() {
+			if IsNoCapacityError(err) {
+				p.unavailableOfferings.MarkUnavailable(ctx, instanceType.Shape,
+					utils.AdToZoneLabelValue(placementProposal.Ad), capacityType)
+			}
+		}()
 	}
 
 	metadata, err := p.instanceMetaProvider.BuildInstanceMetadata(ctx, nodeClaim, nodeClass,

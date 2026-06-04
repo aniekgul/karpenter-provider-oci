@@ -63,6 +63,12 @@ func IsRetryable(err error) bool {
 		http.StatusBadGateway,         // 502
 		http.StatusServiceUnavailable, // 503
 		http.StatusGatewayTimeout:     // 504
+		// "Out of host capacity" surfaces as an HTTP 500 on LaunchInstance. Retrying it only
+		// amplifies the host-capacity shortage and contributes to 429 throttling, so treat it as
+		// non-retryable and let the capacity-fallback logic handle it instead.
+		if IsOutOfHostCapacity(err) {
+			return false
+		}
 		return true
 	}
 	return false
