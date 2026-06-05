@@ -170,6 +170,10 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *corev1.NodeClaim)
 
 	var inst *instance.InstanceInfo
 	var selectedInstanceType *instancetype.OciInstanceType
+	// track whether any launch attempt failed because of host-capacity exhaustion so we can
+	// surface an InsufficientCapacityError (which triggers NodeClaim deletion + reschedule) once
+	// all instance types are consumed.
+	var capacityErr error
 
 	// try launch until all instance types are consumed.
 	for _, instanceType := range instanceTypes {
@@ -199,6 +203,7 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *corev1.NodeClaim)
 			lg.Error(err, "cannot launch instance")
 			// TODO in capacity reservation case, what error will we get if there is no capacity?
 			if instance.IsNoCapacityError(err) {
+				capacityErr = err
 				continue
 			}
 			return nil, cloudprovider.NewCreateError(fmt.Errorf("launch instance failure, %w", err),
@@ -211,6 +216,15 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *corev1.NodeClaim)
 	}
 
 	if inst == nil {
+		// No instance type launched and at least one launch attempt failed due to host-capacity
+		// exhaustion (non-capacity launch errors return earlier). Surface an InsufficientCapacityError
+		// so core Karpenter deletes the NodeClaim and reschedules, enabling fallback to other
+		// offerings / capacity types / NodePools.
+		if capacityErr != nil {
+			errMsg := "all instance types exhausted due to insufficient capacity"
+			lg.Error(capacityErr, errMsg)
+			return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("%s, %w", errMsg, capacityErr))
+		}
 		errMsg := "cannot create node after trying all instance types"
 		finalErr := errors.New(errMsg)
 		lg.Error(finalErr, "")

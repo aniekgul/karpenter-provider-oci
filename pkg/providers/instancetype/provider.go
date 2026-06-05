@@ -20,6 +20,7 @@ import (
 
 	"github.com/coreos/go-semver/semver"
 	ociv1beta1 "github.com/oracle/karpenter-provider-oci/pkg/apis/v1beta1"
+	"github.com/oracle/karpenter-provider-oci/pkg/cache"
 	"github.com/oracle/karpenter-provider-oci/pkg/metrics"
 	"github.com/oracle/karpenter-provider-oci/pkg/oci"
 	"github.com/oracle/karpenter-provider-oci/pkg/providers/capacityreservation"
@@ -79,6 +80,7 @@ type DefaultProvider struct {
 	kubernetesInterface           kubernetes.Interface
 	k8sVersion                    *semver.Version
 	ipFamilies                    []network.IpFamily
+	unavailableOfferings          *cache.UnavailableOfferings
 
 	lock sync.RWMutex
 }
@@ -97,6 +99,7 @@ func New(ctx context.Context,
 	metaRefreshInterval time.Duration,
 	globalShapeConfigs []ociv1beta1.ShapeConfig,
 	ipFamilies []network.IpFamily,
+	unavailableOfferings *cache.UnavailableOfferings,
 	startAsync <-chan struct{}) (*DefaultProvider, error) {
 	p := &DefaultProvider{
 		region:                        region,
@@ -112,6 +115,7 @@ func New(ctx context.Context,
 		client:                        directClient,
 		ipFamilies:                    ipFamilies,
 		kubernetesInterface:           kubernetesInterface,
+		unavailableOfferings:          unavailableOfferings,
 	}
 
 	p.GlobalShapeConfigs = lo.Map(globalShapeConfigs, func(item ociv1beta1.ShapeConfig, _ int) *ociv1beta1.ShapeConfig {
@@ -812,6 +816,21 @@ func (p *DefaultProvider) setOfferings(ctx context.Context, it *OciInstanceType,
 	}
 
 	it.Offerings = append(it.Offerings, offerings...)
+
+	// exclude offerings recently observed to be out of host capacity. Reserved offerings keep
+	// their count-based availability untouched.
+	if p.unavailableOfferings != nil {
+		for _, offering := range it.Offerings {
+			capType := offering.CapacityType()
+			if capType == corev1.CapacityTypeReserved {
+				continue
+			}
+			if offering.Available && p.unavailableOfferings.IsUnavailable(*shapeAndAd.Shape.Shape,
+				offering.Zone(), capType) {
+				offering.Available = false
+			}
+		}
+	}
 
 	if len(it.Offerings) > 0 {
 		for _, offering := range it.Offerings {

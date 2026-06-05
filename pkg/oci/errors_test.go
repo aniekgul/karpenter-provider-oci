@@ -109,6 +109,15 @@ func TestIsRetryable(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "non-retryable 500 out of host capacity",
+			err: fakeServiceError{
+				httpStatus: http.StatusInternalServerError,
+				code:       "InternalError",
+				message:    "Out of host capacity.",
+			},
+			want: false,
+		},
+		{
 			name: "retryable 502",
 			err: fakeServiceError{
 				httpStatus: http.StatusBadGateway,
