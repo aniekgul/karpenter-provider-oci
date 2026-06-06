@@ -27,6 +27,7 @@ import (
 	"github.com/oracle/karpenter-provider-oci/pkg/providers/network"
 	"github.com/oracle/karpenter-provider-oci/pkg/providers/npn"
 	"github.com/oracle/karpenter-provider-oci/pkg/providers/placement"
+	"github.com/oracle/karpenter-provider-oci/pkg/utils"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1132,6 +1133,53 @@ func TestProvider_LaunchInstance_FailurePaths(t *testing.T) {
 		fc.LaunchErr = nil
 	})
 
+}
+
+func TestProvider_LaunchInstance_MarksUnavailableOnSkippableError(t *testing.T) {
+	baseNodeClass := minimalNodeClass()
+	baseClaim := minimalNodeClaim()
+	imgRes := minimalImageResolve()
+	netRes := minimalNetworkResolve()
+	pp := minimalPlacement()
+
+	shape := "VM.Standard.E4.Flex"
+	zone := utils.AdToZoneLabelValue(pp.Ad)
+
+	testCases := []struct {
+		name string
+		err  error
+	}{
+		{name: "out of host capacity", err: outOfHostCapacityError()},
+		{name: "service limit exceeded", err: limitExceededError()},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &fakes.FakeCompute{LaunchErr: tc.err}
+			unavailable := cache.NewUnavailableOfferings(0)
+			p := &DefaultProvider{
+				computeClient:        fc,
+				clusterCompartmentId: "ocid1.compartment.oc1..parent",
+				instanceCache:        cache.NewDefaultGetOrLoadCache[*InstanceInfo](),
+				vnicAttachCache:      cache.NewDefaultGetOrLoadCache[[]*ocicore.VnicAttachment](),
+				bootVolAttachCache:   cache.NewDefaultGetOrLoadCache[[]*ocicore.BootVolumeAttachment](),
+				launchTimeoutVM:      10 * time.Minute,
+				launchTimeoutBM:      20 * time.Minute,
+				pollInterval:         time.Second,
+				unavailableOfferings: unavailable,
+			}
+			imdsp, err := instancemeta.NewProvider(context.TODO(), "10.0.0.1", []byte("CA"), ipV4SingleStack)
+			require.NoError(t, err)
+			p.instanceMetaProvider = imdsp
+
+			// baseClaim has no capacity-type requirement, so decideCapacityType returns on-demand.
+			_, err = p.LaunchInstance(context.TODO(), baseClaim, baseNodeClass,
+				&instancetype.OciInstanceType{Shape: shape}, imgRes, netRes, nil, pp)
+			require.Error(t, err)
+			assert.True(t, unavailable.IsUnavailable(shape, zone, corev1.CapacityTypeOnDemand),
+				"expected the (shape, zone, capacity-type) offering to be marked unavailable")
+		})
+	}
 }
 
 func TestProvider_Cached_Wrappers_Negative(t *testing.T) {

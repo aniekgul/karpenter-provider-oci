@@ -687,6 +687,62 @@ var _ = Describe("CloudProvider Unit Tests", func() {
 			Expect(cloudprovider.IsInsufficientCapacityError(err)).To(BeTrue())
 			Expect(launchCount).To(Equal(2))
 		})
+
+		It("should return insufficient capacity when all instance types hit a service limit", func() {
+			launchCount := 0
+			cp := newUnitTestCloudProvider(unitTestCloudProviderOptions{
+				kubeClient:    kubeClient,
+				instanceTypes: []*instancetype.OciInstanceType{instanceA, instanceB},
+				imageProvider: &FakeImageProvider{
+					ResolveImageForShapeFn: func(_ context.Context, _ *v1beta1.ImageConfig,
+						_ string) (*image.ImageResolveResult, error) {
+						return imageResult, nil
+					},
+				},
+				instanceProvider: &FakeInstanceProvider{
+					LaunchInstanceFn: func(_ context.Context, _ *v1.NodeClaim, _ *v1beta1.OCINodeClass,
+						_ *instancetype.OciInstanceType, _ *image.ImageResolveResult, _ *network.NetworkResolveResult,
+						_ *kms.KmsKeyResolveResult, _ *placement.Proposal) (*instance.InstanceInfo, error) {
+						launchCount++
+						return nil, fakeServiceError{statusCode: 400, code: "LimitExceeded", message: "service limit exceeded"}
+					},
+				},
+			})
+
+			_, err := cp.Create(context.Background(), nodeClaim)
+			Expect(cloudprovider.IsInsufficientCapacityError(err)).To(BeTrue())
+			Expect(launchCount).To(Equal(2))
+		})
+
+		It("should fall back to the next shape when one shape hits a service limit", func() {
+			launchCount := 0
+			cp := newUnitTestCloudProvider(unitTestCloudProviderOptions{
+				kubeClient:    kubeClient,
+				instanceTypes: []*instancetype.OciInstanceType{instanceA, instanceB},
+				imageProvider: &FakeImageProvider{
+					ResolveImageForShapeFn: func(_ context.Context, _ *v1beta1.ImageConfig,
+						_ string) (*image.ImageResolveResult, error) {
+						return imageResult, nil
+					},
+				},
+				instanceProvider: &FakeInstanceProvider{
+					LaunchInstanceFn: func(_ context.Context, _ *v1.NodeClaim, _ *v1beta1.OCINodeClass,
+						it *instancetype.OciInstanceType, _ *image.ImageResolveResult, _ *network.NetworkResolveResult,
+						_ *kms.KmsKeyResolveResult, _ *placement.Proposal) (*instance.InstanceInfo, error) {
+						launchCount++
+						if launchCount == 1 {
+							return nil, fakeServiceError{statusCode: 400, code: "LimitExceeded", message: "service limit exceeded"}
+						}
+						return &instance.InstanceInfo{Instance: testInstanceWithShape(it.Shape, "pool-a")}, nil
+					},
+				},
+			})
+
+			created, err := cp.Create(context.Background(), nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(created.Labels[corev1.LabelInstanceTypeStable]).To(Equal("shape-b"))
+			Expect(launchCount).To(Equal(2))
+		})
 	})
 
 	Context("Drift", func() {
@@ -1009,6 +1065,7 @@ var _ = Describe("CloudProvider NodePool Fallback", func() {
 		preferredClass     string
 		fallbackClass      string
 		unavailable        *ocicache.UnavailableOfferings
+		instanceProvider   *FakeInstanceProvider
 		cp                 *CloudProvider
 		cluster            *state.Cluster
 		prov               *provisioning.Provisioner
@@ -1053,7 +1110,7 @@ var _ = Describe("CloudProvider NodePool Fallback", func() {
 			},
 		}
 
-		instanceProvider := &FakeInstanceProvider{
+		instanceProvider = &FakeInstanceProvider{
 			LaunchInstanceFn: func(_ context.Context, nc *v1.NodeClaim, _ *v1beta1.OCINodeClass,
 				it *instancetype.OciInstanceType, _ *image.ImageResolveResult, _ *network.NetworkResolveResult,
 				_ *kms.KmsKeyResolveResult, _ *placement.Proposal) (*instance.InstanceInfo, error) {
@@ -1128,6 +1185,46 @@ var _ = Describe("CloudProvider NodePool Fallback", func() {
 		Expect(binding2.NodeClaim).ToNot(BeNil())
 		Expect(binding2.NodeClaim.Labels[v1.NodePoolLabelKey]).To(Equal(fallbackPool.Name))
 		Expect(binding2.NodeClaim.Labels[corev1.LabelInstanceTypeStable]).To(Equal(fallbackShape))
+	})
+
+	It("falls back to another NodePool when the preferred pool's launch hits a service limit", func() {
+		// The preferred shape's launch fails with a service-limit (LimitExceeded) error. We emulate
+		// the production LaunchInstance defer by marking the offering unavailable on that error; the
+		// FakeInstanceProvider does not run the real defer. CloudProvider.Create classifies this as an
+		// InsufficientCapacityError, so no node is created this round.
+		instanceProvider.LaunchInstanceFn = func(_ context.Context, nc *v1.NodeClaim, _ *v1beta1.OCINodeClass,
+			it *instancetype.OciInstanceType, _ *image.ImageResolveResult, _ *network.NetworkResolveResult,
+			_ *kms.KmsKeyResolveResult, _ *placement.Proposal) (*instance.InstanceInfo, error) {
+			if it.Shape == preferredShape {
+				unavailable.MarkUnavailable(provCtx, preferredShape, zone, v1.CapacityTypeOnDemand)
+				return nil, fakeServiceError{statusCode: 400, code: "LimitExceeded", message: "service limit exceeded"}
+			}
+			return &instance.InstanceInfo{
+				Instance: testInstanceWithShape(it.Shape, nc.Labels[v1.NodePoolLabelKey]),
+			}, nil
+		}
+
+		// Round 1: the pod schedules onto the higher-weighted preferred pool (its offering is still
+		// available at schedule time), but the launch hits the service limit, so no binding is made.
+		pod := coretest.UnschedulablePod(coretest.PodOptions{ResourceRequirements: smallPodResources})
+		bindings := ExpectProvisioned(provCtx, k8sClient, cluster, cp, prov, pod)
+		Expect(bindings.Get(pod)).To(BeNil())
+
+		// Core's NodeClaim lifecycle deletes the NodeClaim on InsufficientCapacityError; emulate that
+		// so the failed NodeClaim is not counted as in-flight capacity on the next scheduling round.
+		for _, nc := range ExpectNodeClaims(provCtx, k8sClient) {
+			ExpectDeleted(provCtx, k8sClient, nc)
+			cluster.DeleteNodeClaim(nc.Name)
+		}
+
+		// Round 2: the preferred offering is now cached as unavailable, so the scheduler falls back to
+		// the other NodePool.
+		bindings = ExpectProvisioned(provCtx, k8sClient, cluster, cp, prov, pod)
+		binding := bindings.Get(pod)
+		Expect(binding).ToNot(BeNil())
+		Expect(binding.NodeClaim).ToNot(BeNil())
+		Expect(binding.NodeClaim.Labels[v1.NodePoolLabelKey]).To(Equal(fallbackPool.Name))
+		Expect(binding.NodeClaim.Labels[corev1.LabelInstanceTypeStable]).To(Equal(fallbackShape))
 	})
 })
 

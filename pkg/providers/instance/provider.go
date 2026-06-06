@@ -155,12 +155,13 @@ func (p *DefaultProvider) LaunchInstance(ctx context.Context,
 		isPreemptible = true
 	}
 
-	// when a launch attempt fails because of host-capacity exhaustion, record the
-	// (shape, AD/zone, capacity-type) offering as unavailable so it is excluded from offering
-	// availability until the cache entry expires, enabling spot->on-demand and cross-NodePool fallback.
+	// when a launch attempt fails because of a skippable capacity exhaustion (host-capacity
+	// shortage or service-limit/compartment-quota), record the (shape, AD/zone, capacity-type)
+	// offering as unavailable so it is excluded from offering availability until the cache entry
+	// expires, enabling spot->on-demand and cross-NodePool fallback.
 	if p.unavailableOfferings != nil {
 		defer func() {
-			if IsNoCapacityError(err) {
+			if IsSkippableLaunchError(err) {
 				p.unavailableOfferings.MarkUnavailable(ctx, instanceType.Shape,
 					utils.AdToZoneLabelValue(placementProposal.Ad), capacityType)
 			}
