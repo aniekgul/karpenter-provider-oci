@@ -154,6 +154,15 @@ func TestIsRetryable(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "non-retryable 400 limit exceeded",
+			err: fakeServiceError{
+				httpStatus: http.StatusBadRequest,
+				code:       LimitExceeded,
+				message:    "service limit exceeded",
+			},
+			want: false,
+		},
+		{
 			name: "non-retryable generic error",
 			err:  stderrs.New("generic"),
 			want: false,
@@ -240,4 +249,34 @@ func TestIsOutOfHostCapacity(t *testing.T) {
 	}))
 
 	assert.False(t, IsOutOfHostCapacity(stderrs.New("generic")))
+}
+
+func TestIsServiceLimitExceeded(t *testing.T) {
+	assert.False(t, IsServiceLimitExceeded(nil))
+
+	assert.True(t, IsServiceLimitExceeded(fakeServiceError{
+		httpStatus: http.StatusBadRequest,
+		code:       LimitExceeded,
+		message:    "service limit exceeded",
+	}))
+
+	assert.True(t, IsServiceLimitExceeded(fakeServiceError{
+		httpStatus: http.StatusBadRequest,
+		code:       QuotaExceeded,
+		message:    "compartment quota exceeded",
+	}))
+
+	assert.True(t, IsServiceLimitExceeded(pkgerrors.Wrap(fakeServiceError{
+		httpStatus: http.StatusBadRequest,
+		code:       LimitExceeded,
+		message:    "service limit exceeded",
+	}, "wrapped")))
+
+	assert.False(t, IsServiceLimitExceeded(fakeServiceError{
+		httpStatus: http.StatusBadRequest,
+		code:       "SomeOtherCode",
+		message:    "bad request",
+	}))
+
+	assert.False(t, IsServiceLimitExceeded(stderrs.New("generic")))
 }

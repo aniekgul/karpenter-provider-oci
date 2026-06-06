@@ -26,6 +26,13 @@ const (
 	OutOfHostCapacity                   = "Out of host capacity"
 )
 
+// HTTP 400 service-error codes returned when a launch is blocked by a service
+// limit or compartment quota. These are treated as skippable capacity exhaustion.
+const (
+	LimitExceeded = "LimitExceeded"
+	QuotaExceeded = "QuotaExceeded"
+)
+
 var errNotFound = errors.New("not found")
 
 // IsRetryable returns true if the given error is retriable.
@@ -115,4 +122,24 @@ func IsOutOfHostCapacity(err error) bool {
 	serviceErr, ok := common.IsServiceError(err)
 
 	return ok && strings.Contains(serviceErr.GetMessage(), OutOfHostCapacity)
+}
+
+// IsServiceLimitExceeded returns true when the error is an OCI service-limit or
+// compartment-quota failure (HTTP 400 LimitExceeded/QuotaExceeded). Matching is
+// code-based rather than message-based to avoid false positives.
+func IsServiceLimitExceeded(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	serviceErr, ok := common.IsServiceError(errors.Cause(err))
+	if !ok {
+		return false
+	}
+
+	switch serviceErr.GetCode() {
+	case LimitExceeded, QuotaExceeded:
+		return true
+	}
+	return false
 }
