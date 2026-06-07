@@ -311,11 +311,7 @@ func (p *DefaultProvider) decorateInstanceType(ctx context.Context, it *OciInsta
 	setCapacity(it, shape, ocpu, memoryInGbs, nodeClass, p.ipFamilies)
 	setOverhead(it, shape, ocpu, memoryInGbs, nodeClass)
 
-	basePrice, priceAvailable := func() (float64, bool) {
-		p.lock.RLock()
-		defer p.lock.RUnlock()
-		return p.calculatePrices(shape, ocpu, memoryInGbs, cpuBaseline)
-	}()
+	basePrice, priceAvailable := p.calculatePrices(shape, ocpu, memoryInGbs, cpuBaseline)
 
 	vnicAvailable := true
 	secondVnicsNum := -1
@@ -782,11 +778,7 @@ func (p *DefaultProvider) setOfferings(ctx context.Context, it *OciInstanceType,
 	offerings := makeOnDemandOffering(*shapeAndAd.Shape.Shape, shapeAndAd.Ads, basePrice, available,
 		placementRestrictFunc)
 
-	isPreemptible := func() bool {
-		p.lock.RLock()
-		defer p.lock.RUnlock()
-		return p.isPreemptibleShape(*shapeAndAd.Shape.Shape)
-	}()
+	isPreemptible := p.isPreemptibleShape(*shapeAndAd.Shape.Shape)
 
 	var capResAdMap map[capacityreservation.CapacityReserveIdAndAd]map[string]capacityreservation.ShapeAvailability
 	if len(nodeClass.Spec.CapacityReservationConfigs) > 0 {
