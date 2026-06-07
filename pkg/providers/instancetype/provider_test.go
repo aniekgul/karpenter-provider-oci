@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/coreos/go-semver/semver"
@@ -2322,5 +2323,123 @@ func TestGetMaxVnicAttachmentsForShape(t *testing.T) {
 			got := p.getMaxVnicAttachmentsForShape(context.Background(), shape, tt.ocpu)
 			assert.Equal(t, tt.want, got)
 		})
+	}
+}
+
+// TestListInstanceTypes_NoDeadlockWithConcurrentWriter is a regression test for the silent
+// reconcile hang where the leader pod stopped doing work for ~30h without crashing or logging.
+//
+// ListInstanceTypes acquires p.lock.RLock for its whole duration and, deep in its call chain
+// (decorateInstanceType / setOfferings), used to re-acquire p.lock.RLock. sync.RWMutex forbids
+// recursive read-locking: once a writer (refreshShapes/reloadConfigFile, which fire on a ~24h
+// timer) calls p.lock.Lock and blocks waiting for the outer reader, every subsequent RLock --
+// including the nested one from the goroutine that already holds the outer RLock -- blocks to
+// avoid writer starvation. The outer reader then waits forever on its own nested RLock while the
+// writer waits forever on the outer reader: a permanent deadlock that wedges every controller
+// calling ListInstanceTypes.
+//
+// This test drives many concurrent ListInstanceTypes readers against a writer that repeatedly
+// grabs the write lock (as refreshShapes does). With the recursive RLock it deadlocks and the
+// watchdog fires; with the fix it completes quickly.
+func TestListInstanceTypes_NoDeadlockWithConcurrentWriter(t *testing.T) {
+	makeProvider := func() *DefaultProvider {
+		return &DefaultProvider{
+			shapeAdMap: map[string]*ShapeAndAd{
+				"VM.Standard.E3.8": {
+					Shape: &ocicore.Shape{
+						Shape:              lo.ToPtr("VM.Standard.E3.8"),
+						IsFlexible:         lo.ToPtr(false),
+						Ocpus:              lo.ToPtr(float32(8)),
+						MemoryInGBs:        lo.ToPtr(float32(64)),
+						MaxVnicAttachments: lo.ToPtr(4),
+					},
+					Ads: []string{"tenancy:PHX-AD-1", "tenancy:PHX-AD-2"},
+				},
+			},
+			shapeToPrice: map[string]*ShapePriceInfo{
+				"VM.STANDARD.E3.8": {ShapeName: lo.ToPtr("VM.Standard.E3.8"), OcpuUnitPrice: 0.05,
+					MemoryUnitPrice: 0.01, DiskUnitPrice: 0},
+			},
+			preemptibleShapes: PreemptibleShapes{"VM.STANDARD.E3": "VM.Standard.E3"},
+		}
+	}
+
+	nc := &ociv1beta1.OCINodeClass{
+		Spec: ociv1beta1.OCINodeClassSpec{
+			VolumeConfig: &ociv1beta1.VolumeConfig{
+				BootVolumeConfig: &ociv1beta1.BootVolumeConfig{
+					ImageConfig: &ociv1beta1.ImageConfig{ImageType: ociv1beta1.OKEImage},
+				},
+			},
+			NetworkConfig: &ociv1beta1.NetworkConfig{
+				PrimaryVnicConfig: &ociv1beta1.SimpleVnicConfig{
+					SubnetAndNsgConfig: &ociv1beta1.SubnetAndNsgConfig{
+						SubnetConfig: &ociv1beta1.SubnetConfig{SubnetId: lo.ToPtr("ocid1.subnet.oc1..x")},
+					},
+				},
+			},
+		},
+	}
+
+	p := makeProvider()
+
+	const (
+		readers          = 8
+		iterationsPerGor = 2000
+	)
+
+	done := make(chan struct{})
+	stopWriter := make(chan struct{})
+	writerDone := make(chan struct{})
+	// readersWg tracks only the readers: the writer runs until stopWriter is closed, so it must
+	// not be part of the completion wait or it would never let wg.Wait return.
+	var readersWg sync.WaitGroup
+
+	// Writer goroutine: mimics refreshShapes/reloadConfigFile taking p.lock.Lock periodically.
+	// The brief pause keeps the writer from starving readers (the real writers fire on a ~24h
+	// timer) while still frequently entering the "writer pending" state that triggers the old
+	// recursive-RLock deadlock.
+	go func() {
+		defer close(writerDone)
+		for {
+			select {
+			case <-stopWriter:
+				return
+			default:
+			}
+			p.lock.Lock()
+			// emulate the writers swapping the shared maps under the write lock
+			p.shapeAdMap = makeProvider().shapeAdMap
+			p.lock.Unlock()
+			time.Sleep(200 * time.Microsecond)
+		}
+	}()
+
+	// Reader goroutines: call ListInstanceTypes concurrently.
+	for i := 0; i < readers; i++ {
+		readersWg.Add(1)
+		go func() {
+			defer readersWg.Done()
+			for j := 0; j < iterationsPerGor; j++ {
+				its, err := p.ListInstanceTypes(context.Background(), nc, make([]v1.Taint, 0))
+				require.NoError(t, err)
+				require.NotEmpty(t, its)
+			}
+		}()
+	}
+
+	go func() {
+		readersWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		close(stopWriter)
+		<-writerDone
+	case <-time.After(30 * time.Second):
+		close(stopWriter)
+		t.Fatal("ListInstanceTypes deadlocked with a concurrent writer: " +
+			"recursive p.lock.RLock in the ListInstanceTypes call chain")
 	}
 }
