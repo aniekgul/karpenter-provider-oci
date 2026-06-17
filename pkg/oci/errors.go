@@ -119,9 +119,16 @@ func IsNotFound(err error) bool {
 }
 
 func IsOutOfHostCapacity(err error) bool {
-	serviceErr, ok := common.IsServiceError(err)
+	if err == nil {
+		return false
+	}
 
-	return ok && strings.Contains(serviceErr.GetMessage(), OutOfHostCapacity)
+	serviceErr, ok := common.IsServiceError(err)
+	if ok {
+		return strings.Contains(serviceErr.GetMessage(), OutOfHostCapacity)
+	}
+
+	return strings.Contains(err.Error(), OutOfHostCapacity)
 }
 
 // IsServiceLimitExceeded returns true when the error is an OCI service-limit or
